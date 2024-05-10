@@ -1,48 +1,62 @@
 import os
-import asyncio
 import json
+import yaml
 
 from typing import Any, Union
 
-import psycopg2
-import nats
 from openai import OpenAI
 
-NATS_SERVER = os.getenv('NATS_SERVER', 'nats://localhost:4222')
-INCOMING_NATS_SUBJECT = os.getenv('NATS_SUBJECT', 'scenes')
-OUTGOING_NATS_SUBJECT = os.getenv('NATS_SUBJECT', 'descriptions')
+from dungeonmaster_db.adapter import DbConnection as db_conn
 
-DB_NAME = os.getenv('DUNGEONMASTER_DB_NAME', 'dungeonmaster_dev')
-DB_HOST = os.getenv('DUNGEONMASTER_DB_HOST', 'localhost')
-DB_USER = os.getenv('DUNGEONMASTER_DB_USER', 'dungeonmaster')
-DB_PASSWORD = os.getenv('DUNGEONMASTER_DB_PASSWORD', 'dungeonmaster')
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+LLM_CONFIG = {"model": "lmstudio-community/Meta-Llama-3-8B-Instruct-GGUF"}
 
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-LLM_CONFIG = {
-    "model": "gpt-3.5-turbo"
-}   
 
-def db_client():
-    return psycopg2.connect(
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        host=DB_HOST
-    )
+def build_llm_config(name: Union[str, None]) -> dict:
+    with open("llm_config.yml", "r") as f:
+        config_yaml = yaml.safe_load(f)
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+    return config_yaml.get(name, {})
+
+
+client = OpenAI(base_url="http://localhost:1234/v1", api_key="lm-studio")
+
 
 ### Database
+def fetch_full_location_info(session_id: int) -> None | str:
+    "Given a session ID, fetches the current location id and time of day from the database. Use the current location ID to fetch the full location info."
+    session = None
 
-def fetch_location(
-        location_id: int,
-        session_id: Union[int, None] = None
-        ) -> None | str:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+
+            # Get the session info
+            cur.execute("SELECT * FROM sessions WHERE id = %s", (session_id,))
+            result = cur.fetchone()
+            session = {
+                "id": result[0],
+                "location_id": result[1],
+                "time_of_day": result[2],
+            }
+            # print("TIME OF DAY:", session["time_of_day"])
+
+    if session is None:
+        return None
+    else:
+        location = fetch_location(session["location_id"])
+        if location.get("id"):
+            location["time_of_day"] = session["time_of_day"]
+            return json.dumps(location)
+
+
+def fetch_location(location_id: int) -> dict:
     "Given a location ID, fetches the location from the database and returns it as JSON."
     location = None
     exits = []
 
-    with db_client() as conn:
+    with db_conn() as conn:
+        location = {}
+
         with conn.cursor() as cur:
 
             # Get the base location info
@@ -51,6 +65,9 @@ def fetch_location(
                 (location_id,)
             )
             result = cur.fetchone() or {}
+            if result is None:
+                return {}
+
             location = {
                 "id": result[0],
                 "starting_location_id": result[1],
@@ -64,7 +81,7 @@ def fetch_location(
             print("LOCATION:", location)
 
             # Get the exits where the start_location_id or end_location_id is the location_id
-            if location is not None:
+            if location.get("id"):
                 cur.execute(
                     """
                     SELECT id, start_location_id, end_location_id, name, description, category, is_one_way, is_fast_travel_path, describe_end_location_exterior
@@ -89,34 +106,22 @@ def fetch_location(
                             "describe_end_location_exterior": row[8],
                         })
                     location["exits"] = exits
-                print("EXITS:", location["exits"])
+                # print("EXITS:", location["exits"])
 
-            # Get the game session info if id is provided
-            cur.execute(
-                "SELECT * FROM game_sessions WHERE id = %s",
-                (session_id,)
-            )
-            result = cur.fetchone()
-            print("TIME OF DAY:", result)
-            if result is not None:
-                location["current_time"] = result[0]
-    
-    if location is None:
-        return None
-    else:
-        return json.dumps(location)
+    return location
+
 
 ### Agent
 
 system_prompt = """
-You are an agent that takes JSON scene descriptions and fleshes them out into full vivid descriptions for a story. Give your description in the second person ('You see a room with...', 'The tree towers before you...') and write them using the interior_description field as the basis. The notes are to guide your description, but should be concealed from the player and should not be mentioned explicitly.
+You are an agent that takes JSON scene descriptions and fleshes them out into vivid but succinct descriptions for a story. Give your description in the second person ('You see a room with...', 'The tree towers before you...') and write them using the interior_description field as the basis. The notes are to guide your description, but should be concealed from the player and should not be mentioned explicitly.
 
 If the time of day is included, take that into account in your description. Consider differences in noises, activitites, lighting.
 
-Mention all non-hidden exits, but do not make up any. If an exit specifies to describe the exit end location's exterior, do so.
+Describe all non-hidden exits, but do not make up any. Do not mention hidden exits. Do not use the exits' names. If an exit specifies to describe the exit end location's exterior, do so.
 """
 
-user_prompt = fetch_location(23, 1)
+user_prompt = fetch_full_location_info(1)
 
 response = client.chat.completions.create(
             messages=[
@@ -131,5 +136,5 @@ response = client.chat.completions.create(
             presence_penalty=0,
         )
 
-print("LOCATION JSON:\n", user_prompt)
+# print("LOCATION JSON:\n", user_prompt)
 print("RESPONSE:\n", response.choices[0].message.content)
