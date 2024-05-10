@@ -1,0 +1,1 @@
+nats: nats-server -V -l nats.log
